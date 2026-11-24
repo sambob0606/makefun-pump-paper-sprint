@@ -15,6 +15,15 @@
 //
 // Deterministic: insertion-ordered maps only, no clock, no randomness, no environment.
 // The harness replays the bot twice and the two action logs must match byte for byte.
+//
+// Performance (round-2 fix for a dev-phase run_completes timeout): the per-batch work
+// is O(coins in their 8-slot decision window), not O(every coin ever created) —
+// decided tapes leave the pending set and are pruned from the tape map unless held
+// or kept as a guardrail probe, and each curve's price is computed once per batch
+// and cached. The dev window grades identically to before the fix (same
+// result_sha256), only faster; the timeout was most likely grader-side load, but
+// the final 6-hour window carries ~4x the dev window's events, where the old
+// quadratic scan would have cost ~16x the bot time.
 
 import { LAMPORTS_PER_SOL, runBot, type Batch, type BotState, type BuyInput, type OrderInput, type SellInput } from './vendor/makefun-bot.ts';
 
@@ -65,18 +74,33 @@ interface Held {
   creatorSoldAfterBuy: boolean;
 }
 
-/** Price of one token in SOL from a curve's virtual reserves. */
-function priceSol(curve: { virtual_quote_reserves: bigint; virtual_token_reserves: bigint }): number {
-  if (curve.virtual_token_reserves === 0n) return 0;
-  return Number(curve.virtual_quote_reserves) / Number(curve.virtual_token_reserves);
+/** Price of one token in SOL from a curve's virtual reserves, cached per batch:
+ * the same curve is priced once for the exit check, once for the entry filter and
+ * once when a new position is recorded, and the BigInt->Number division is the most
+ * expensive arithmetic in the hot path. Cleared at the top of every onBatch, so a
+ * cached price never survives into a batch with newer reserves. */
+const priceCache = new Map<string, number>();
+function priceSol(mint: string, curve: { virtual_quote_reserves: bigint; virtual_token_reserves: bigint }): number {
+  const cached = priceCache.get(mint);
+  if (cached !== undefined) return cached;
+  const price = curve.virtual_token_reserves === 0n
+    ? 0
+    : Number(curve.virtual_quote_reserves) / Number(curve.virtual_token_reserves);
+  priceCache.set(mint, price);
+  return price;
 }
 
 /** Marked value of a holding in SOL at the curve's current price. */
-function valueSol(tokens: bigint, curve: { virtual_quote_reserves: bigint; virtual_token_reserves: bigint }): number {
-  return Number(tokens) * priceSol(curve);
+function valueSol(tokens: bigint, mint: string, curve: { virtual_quote_reserves: bigint; virtual_token_reserves: bigint }): number {
+  return Number(tokens) * priceSol(mint, curve);
 }
 
 const tapes = new Map<string, Tape>();
+// Undecided coins only: the entries loop scans this map every batch, so keeping
+// decided coins out of it keeps the per-batch scan O(coins inside their 8-slot
+// decision window) instead of O(every coin ever created) — the difference between
+// finishing the 6-hour final window and timing out in the grader's 1800 s budget.
+const pending = new Map<string, Tape>();
 const held = new Map<string, Held>();
 const probePool = new Map<string, Tape>(); // creator-clean coins that failed the sniper filter
 let batchesSeen = 0;
@@ -90,7 +114,7 @@ function updateTapes(batch: Batch): void {
       const createPrice = e.virtual_token_reserves === '0'
         ? 0
         : Number(BigInt(e.virtual_quote_reserves)) / Number(BigInt(e.virtual_token_reserves));
-      tapes.set(e.mint, {
+      const tape: Tape = {
         creator: e.creator,
         createdSlot: e.slot,
         createPrice,
@@ -100,7 +124,9 @@ function updateTapes(batch: Batch): void {
         buySol: 0n,
         sellSol: 0n,
         decided: false,
-      });
+      };
+      tapes.set(e.mint, tape);
+      pending.set(e.mint, tape);
     } else if (e.event === 'TradeEvent') {
       const tape = tapes.get(e.mint);
       if (tape === undefined) continue;
@@ -125,7 +151,7 @@ function updateTapes(batch: Batch): void {
 }
 
 /** True when the opening tape passes every sniper filter. */
-function tapeIsClean(tape: Tape, curve: { real_quote_reserves: bigint }): boolean {
+function tapeIsClean(tape: Tape, mint: string, curve: { real_quote_reserves: bigint }): boolean {
   if (tape.creatorBuySol > CREATOR_MAX_BUY_SOL) return false;
   if (tape.creatorSold) return false;
   if (tape.buyers.size < MIN_BUYERS) return false;
@@ -135,7 +161,7 @@ function tapeIsClean(tape: Tape, curve: { real_quote_reserves: bigint }): boolea
   const realSol = curve.real_quote_reserves;
   if (realSol < MIN_REAL_SOL || realSol > MAX_REAL_SOL) return false;
   if (tape.createPrice <= 0) return false;
-  const now = priceSol(curve);
+  const now = priceSol(mint, curve);
   const low = (tape.createPrice * PRICE_LOW_BPS) / 10_000;
   const high = (tape.createPrice * PRICE_HIGH_BPS) / 10_000;
   if (now < low || now > high) return false;
@@ -145,12 +171,18 @@ function tapeIsClean(tape: Tape, curve: { real_quote_reserves: bigint }): boolea
 await runBot({
   onBatch(state: BotState, batch: Batch): OrderInput[] {
     batchesSeen += 1;
+    priceCache.clear();
     updateTapes(batch);
 
     // Sync exit bookkeeping with the account: a position the harness closed
-    // (curve completed, replay flattened) leaves our book.
-    for (const mint of [...held.keys()]) {
-      if (!state.positions.has(mint)) held.delete(mint);
+    // (curve completed, replay flattened) leaves our book, and its tape — decided,
+    // never traded again — leaves with it. No array copy: deleting from a Map
+    // while iterating its keys is safe.
+    for (const mint of held.keys()) {
+      if (!state.positions.has(mint)) {
+        held.delete(mint);
+        tapes.delete(mint);
+      }
     }
     // Count round trips from our own sell fills.
     for (const f of batch.fills) {
@@ -188,7 +220,7 @@ await runBot({
       const pos = state.positions.get(mint);
       const curve = state.curves.get(mint);
       if (pos === undefined || curve === undefined || curve.complete) continue;
-      const value = valueSol(pos.token_amount, curve);
+      const value = valueSol(pos.token_amount, mint, curve);
       if (value > h.peakSol) h.peakSol = value;
       const cost = h.costSol > 0 ? h.costSol : Number(pos.cost_lamports) / 1e9;
       const sellAll =
@@ -204,28 +236,46 @@ await runBot({
     }
 
     // --- entries: decide each undecided candidate once, inside its first 8 slots.
-    for (const [mint, tape] of tapes) {
+    // Only pending (undecided) tapes are scanned; a decided tape leaves pending, and
+    // leaves tapes too unless it is bought (creator-sell tracking needs it) or kept
+    // as a guardrail probe (its tape must keep folding trades). This keeps tapes
+    // bounded to the live decision window + held + probe coins instead of growing
+    // with every coin the replay ever created.
+    for (const [mint, tape] of pending) {
       if (orders.length >= maxOrders || slots <= 0) break;
-      if (tape.decided) continue;
       const curve = state.curves.get(mint);
       if (curve === undefined || curve.complete) {
         tape.decided = true;
+        pending.delete(mint);
+        tapes.delete(mint);
         continue;
       }
       const age = batch.slot - tape.createdSlot;
       if (age > ENTRY_MAX_AGE_SLOTS) {
         tape.decided = true;
+        pending.delete(mint);
         // Creator-clean coins that failed the full filter stay available as probes.
         if (tape.creatorBuySol <= CREATOR_MAX_BUY_SOL && !tape.creatorSold && tape.buyers.size >= 2) {
           probePool.set(mint, tape);
+        } else {
+          tapes.delete(mint);
         }
         continue;
       }
-      if (!tapeIsClean(tape, curve)) continue;
+      if (!tapeIsClean(tape, mint, curve)) continue;
       tape.decided = true;
+      pending.delete(mint);
       tryBuy(mint, STAKE);
     }
 
+    // Once 20 round trips are banked the guardrail is met for good, so the probe
+    // pool is dead state: drop it (and its tapes) instead of carrying it to the
+    // end of the window. Probes can never fire again after this point, so the
+    // trading behaviour is unchanged.
+    if (roundTrips >= 20 && probePool.size > 0) {
+      for (const mint of probePool.keys()) tapes.delete(mint);
+      probePool.clear();
+    }
     // --- guardrail probes: only while under 20 round trips, at most one per 20 batches.
     if (
       roundTrips < 20 &&
@@ -238,10 +288,14 @@ await runBot({
         const curve = state.curves.get(mint);
         if (curve === undefined || curve.complete || state.positions.has(mint)) {
           probePool.delete(mint);
+          // Only drop the tape when we hold nothing on it: a held coin's tape
+          // still feeds the creator-sell exit.
+          if (!state.positions.has(mint)) tapes.delete(mint);
           continue;
         }
         if (tape.creatorSold) {
           probePool.delete(mint);
+          tapes.delete(mint);
           continue;
         }
         tryBuy(mint, PROBE_STAKE);
@@ -258,7 +312,7 @@ await runBot({
       if (!held.has(mint)) {
         const curve = state.curves.get(mint);
         const cost = Number(pos.cost_lamports) / 1e9;
-        const value = curve === undefined ? cost : valueSol(pos.token_amount, curve);
+        const value = curve === undefined ? cost : valueSol(pos.token_amount, mint, curve);
         held.set(mint, { mint, entrySlot: batch.slot, costSol: cost, peakSol: value, creatorSoldAfterBuy: false });
       } else {
         const h = held.get(mint);
