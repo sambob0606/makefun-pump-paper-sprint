@@ -2,13 +2,13 @@
 //
 // Strategy: launch sniper. A coin becomes a candidate on its CreateEvent. Within its first
 // 8 slots we watch its opening tape: we buy only when the launch looks clean — the creator
-// bought at most 5 SOL and has not sold, at least 3 distinct non-creator buyers showed up,
+// bought at most 5 SOL and has not sold, at least 4 distinct non-creator buyers showed up,
 // other sellers sold at most 20% of what buyers bought, net inflow is at least 0.3 SOL,
 // the curve holds 1-30 real SOL, and the price sits within -10% / +50% of its create price.
 // One 0.05 SOL buy per coin, never more than 5 open positions.
 //
 // Exits (checked every batch on the position's cost basis, fees included): take profit at
-// +15%, stop loss at -10%, a 12% trailing stop once the position is up 10%, a 200-slot max
+// +15%, stop loss at -10%, an 8% trailing stop once the position is up 10%, a 200-slot max
 // hold, and an immediate exit if the creator sells after we bought. If the sniper filter
 // starves us (fewer than 20 round trips after 3000 batches), small 0.02 SOL probes on
 // creator-clean coins that failed the full filter keep the 20-coin guardrail in reach.
@@ -24,9 +24,9 @@ const PROBE_STAKE = SOL / 50n; // 0.02 SOL per guardrail probe
 const MIN_BUY = SOL / 100n; // 0.01 SOL: a round trip below this does not count
 const MAX_SLIPPAGE_BPS = 10_000;
 
-const ENTRY_MAX_AGE_SLOTS = 8;
+const ENTRY_MAX_AGE_SLOTS = 8; // reverted: the 12-slot window admitted 4 extra coins and lost 0.017 SOL more on dev
 const CREATOR_MAX_BUY_SOL = 5n * SOL;
-const MIN_BUYERS = 3;
+const MIN_BUYERS = 4; // distinct non-creator buyers required — one more buyer filters weaker launches
 const MAX_SELL_SHARE_BPS = 2_000; // others' sells at most 20% of buys
 const MIN_NET_INFLOW = (3n * SOL) / 10n; // 0.3 SOL
 const MIN_REAL_SOL = SOL; // 1 SOL
@@ -37,7 +37,7 @@ const PRICE_HIGH_BPS = 15_000; // +50% vs create price
 const TAKE_PROFIT_BPS = 11_500; // +15% on cost
 const STOP_LOSS_BPS = 9_000; // -10% on cost
 const TRAIL_TRIGGER_BPS = 11_000; // trailing arms once up 10%
-const TRAIL_DROP_BPS = 8_800; // sell 12% below the peak value
+const TRAIL_DROP_BPS = 9_200; // sell 8% below the peak value
 const MAX_HOLD_SLOTS = 200;
 
 const PROBE_AFTER_BATCHES = 3_000;
